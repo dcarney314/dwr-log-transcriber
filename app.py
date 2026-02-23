@@ -5,173 +5,165 @@ import io
 # --- INITIAL SETUP ---
 st.set_page_config(layout="wide", page_title="DWR Well Log Transcriber")
 
-# Initialize session state for data persistence
+# Initialize session state
 if 'master_df' not in st.session_state:
     st.session_state.master_df = None
 if 'log_data' not in st.session_state:
-    st.session_state.log_data = pd.DataFrame(columns=['Top Depth', 'Bottom Depth', 'Lithology'])
+    st.session_state.log_data = pd.DataFrame([{"Top Depth": None, "Bottom Depth": None, "Lithology": ""}] * 10)
 if 'output_df' not in st.session_state:
     st.session_state.output_df = pd.DataFrame(columns=['Receipt', 'Top Depth', 'Bottom Depth', 'Lithology'])
 if 'current_index' not in st.session_state:
     st.session_state.current_index = 0
 
+# --- DATA PROCESSING ---
+def process_master(df):
+    target_indices = [0, 1, 2, 22, 23, 24, 25]
+    df = df.iloc[:, target_indices].copy()
+    df.columns = ['Receipt', 'Permit Number', 'Permit Status', 'UTM X', 'UTM Y', 'Latitude', 'Longitude']
+    df['Receipt'] = 'R' + df['Receipt'].astype(str)
+    df['Processing Status'] = 'Pending'
+    df['Notes'] = ''
+    return df
+
 # --- VALIDATION ENGINE ---
-def validate_log(df):
+def get_validation_status(df):
+    """Checks each row and returns a list of status icons/messages."""
+    status = ["✅"] * len(df)
     errors = []
-    if df.empty:
-        errors.append("The table is empty. Please enter data before submitting.")
-        return errors
-    if df.isnull().values.any() or (df == "").values.any():
-        errors.append("Empty cells detected. Every row needs Top, Bottom, and Lithology.")
     
     for i in range(len(df)):
+        row = df.iloc[i]
         try:
-            top = float(df.iloc[i]['Top Depth'])
-            bottom = float(df.iloc[i]['Bottom Depth'])
-            if top >= bottom:
-                errors.append(f"Row {i+1}: Top ({top}) must be less than Bottom ({bottom}).")
+            # Skip empty rows for icon logic
+            if pd.isna(row['Top Depth']) and pd.isna(row['Bottom Depth']):
+                status[i] = "⚪"
+                continue
+                
+            t, b = float(row['Top Depth']), float(row['Bottom Depth'])
+            
+            # Logic Check
+            if t >= b:
+                status[i] = "❌ Logic Error"
+                errors.append(f"Row {i+1}: Top must be less than Bottom.")
+            
+            # Gap Check
             if i < len(df) - 1:
-                next_top = float(df.iloc[i+1]['Top Depth'])
-                if bottom != next_top:
-                    errors.append(f"Gap/Overlap at Row {i+1}: Bottom ({bottom}) doesn't match next Top ({next_top}).")
-        except ValueError:
-            errors.append(f"Row {i+1}: Depths must be numeric values.")
-    return errors
+                next_val = df.iloc[i+1]['Top Depth']
+                if not pd.isna(next_val):
+                    if b != float(next_val):
+                        status[i] = "⚠️ Gap Below"
+                        errors.append(f"Gap between Row {i+1} and {i+2} ({b} vs {next_val})")
+        except:
+            status[i] = "❓ Non-Numeric"
+            errors.append(f"Row {i+1}: Invalid depth entry.")
+            
+    return status, errors
 
 # --- DIALOGS ---
 @st.dialog("Confirm No Data")
 def confirm_no_data(receipt):
-    st.write(f"Are you sure you want to mark {receipt} as No Data (ND)?")
+    st.write(f"Mark {receipt} as No Data (ND)?")
     if st.button("Confirm ND"):
-        idx = st.session_state.master_df[st.session_state.master_df['Col_0'] == receipt].index
-        st.session_state.master_df.loc[idx, 'Status'] = 'ND'
+        idx = st.session_state.master_df[st.session_state.master_df['Receipt'] == receipt].index
+        st.session_state.master_df.loc[idx, 'Processing Status'] = 'ND'
         st.session_state.current_index += 1
-        st.success(f"Marked {receipt} as ND.")
         st.rerun()
 
 @st.dialog("Confirm Submission")
 def confirm_submit(receipt, notes, data):
-    st.write(f"Is the log for {receipt} complete and verified?")
+    st.write(f"Save log for {receipt}? (Empty rows will be preserved)")
     if st.button("Yes, Submit Log"):
-        # 1. Update Master
-        idx = st.session_state.master_df[st.session_state.master_df['Col_0'] == receipt].index
-        st.session_state.master_df.loc[idx, 'Status'] = 'Complete'
+        idx = st.session_state.master_df[st.session_state.master_df['Receipt'] == receipt].index
+        st.session_state.master_df.loc[idx, 'Processing Status'] = 'Complete'
         st.session_state.master_df.loc[idx, 'Notes'] = notes
-        
-        # 2. Append to Output
         temp_output = data.copy()
         temp_output['Receipt'] = receipt
         st.session_state.output_df = pd.concat([st.session_state.output_df, temp_output], ignore_index=True)
-        
-        # 3. Reset for next well
-        st.session_state.log_data = pd.DataFrame(columns=['Top Depth', 'Bottom Depth', 'Lithology'])
+        st.session_state.log_data = pd.DataFrame([{"Top Depth": None, "Bottom Depth": None, "Lithology": ""}] * 10)
         st.session_state.current_index += 1
-        st.success("Log successfully appended to output!")
         st.rerun()
 
-# --- SIDEBAR CONTROLS ---
+# --- SIDEBAR ---
 with st.sidebar:
-    st.title("⚙️ Project Controls")
-    st.error("⚠️ DATA SAFETY: Download CSVs before closing the tab!")
-    
-    uploaded_file = st.file_uploader("1. Upload DWR Master Excel", type="xlsx")
-    
+    st.title("⚙️ Controls")
+    uploaded_file = st.file_uploader("Upload DWR Master Excel", type="xlsx")
     if st.session_state.master_df is not None:
         st.markdown("---")
-        total = len(st.session_state.master_df)
-        done = len(st.session_state.master_df[st.session_state.master_df['Status'] != 'Pending'])
-        st.write(f"**Progress:** {done}/{total} Wells")
+        total, done = len(st.session_state.master_df), len(st.session_state.master_df[st.session_state.master_df['Processing Status'] != 'Pending'])
+        st.write(f"**Progress:** {done}/{total}")
         st.progress(done / total)
-        
-        st.markdown("---")
-        st.header("💾 2. Export Data")
-        st.download_button("Download Master (Status)", st.session_state.master_df.to_csv(index=False), "master_tracking.csv")
-        st.download_button("Download Output (Data)", st.session_state.output_df.to_csv(index=False), "well_lithology_data.csv")
+        st.download_button("Download Master", st.session_state.master_df.to_csv(index=False), "master_tracking.csv")
+        st.download_button("Download Output", st.session_state.output_df.to_csv(index=False), "well_lithology_data.csv")
 
-# --- MAIN INTERFACE ---
-st.title("🚰 DWR Well Log Transcriber")
-
-main_tab, instr_tab = st.tabs(["🏗️ Workspace", "📖 Instructions & Best Practices"])
+# --- MAIN APP ---
+main_tab, instr_tab = st.tabs(["🏗️ Workspace", "📖 Instructions"])
 
 with instr_tab:
-    st.header("Transcription Protocol")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("🚀 Quick Start")
-        st.markdown("""
-        1. **Select Well:** Use the dropdown or search to find your Receipt.
-        2. **Open Log:** Click the DWR link to open the PDF record.
-        3. **Entry:** Enter Top depths. Hit **⚡ Auto-Fill** to link them to Bottom depths.
-        4. **Submit:** Click 'Submit Log'. The app will validate your data for errors.
-        """)
-    with c2:
-        st.subheader("🛡️ Best Practices")
-        st.info("**Leading Zeroes:** The 'R' prefix protects your IDs from Excel's auto-formatting.")
-        st.warning("**No Gaps:** Ensure the 'Bottom' of one layer matches the 'Top' of the next layer.")
-        st.success("**Final Step:** Always download BOTH files at the end of your session.")
-    st.subheader("🕵️ Quality Control Tip")
+    st.header("Logging Protocol")
     st.markdown("""
-    - **Handwriting & Scans:** If a driller's log is illegible, do not guess. 
-    - **The Action:** Use the **No Data** button and add a Note: *"Scan quality too low to interpret"* or *"Handwriting unreadable."* - **The Why:** This ensures your future statistical models in R aren't trained on "guessed" data.
+    - **⚪ White Circle:** Row is empty.
+    - **✅ Green Check:** Row looks good.
+    - **⚠️ Yellow Warning:** Depth gap between this row and the next.
+    - **❌ Red X:** Top depth is greater than or equal to Bottom depth.
+    - **🕵️ Data Quality:** If the log is unreadable, use 'No Data' and note why.
     """)
+
 with main_tab:
     if uploaded_file:
         if st.session_state.master_df is None:
-            raw_df = pd.read_excel(uploaded_file, header=None)
-            raw_df.columns = [f"Col_{i}" for i in range(len(raw_df.columns))]
-            raw_df['Col_0'] = 'R' + raw_df['Col_0'].astype(str)
-            raw_df['Status'] = 'Pending'
-            raw_df['Notes'] = ''
-            st.session_state.master_df = raw_df
+            st.session_state.master_df = process_master(pd.read_excel(uploaded_file, header=None))
 
-        # WELL SELECTION
-        receipts = st.session_state.master_df['Col_0'].tolist()
+        receipts = st.session_state.master_df['Receipt'].tolist()
         if st.session_state.current_index >= len(receipts):
             st.success("All wells processed!")
             st.session_state.current_index = len(receipts) - 1
 
-        selected_receipt = st.selectbox("Select Well Receipt", receipts, index=st.session_state.current_index)
+        selected_receipt = st.selectbox("Current Well", receipts, index=st.session_state.current_index)
         st.session_state.current_index = receipts.index(selected_receipt)
 
-        # LINK & INFO
+        # DWR LINK
         clean_receipt = selected_receipt.lstrip('R')
-        dwr_url = f"https://dwr.state.co.us/Tools/WellPermits/{clean_receipt}"
-        st.markdown(f"### 📄 [Open DWR Record for {clean_receipt}]({dwr_url})")
+        st.markdown(f"## 📄 [Open DWR Record {clean_receipt}](https://dwr.state.co.us/Tools/WellPermits/{clean_receipt})")
         
-        well_info = st.session_state.master_df[st.session_state.master_df['Col_0'] == selected_receipt].iloc[0]
-        notes = st.text_input("Transcription Notes", value=well_info['Notes'], placeholder="Enter specific observations...")
+        well_info = st.session_state.master_df[st.session_state.master_df['Receipt'] == selected_receipt].iloc[0]
+        notes = st.text_input("Notes", value=well_info['Notes'])
 
-        # TABLE
-        st.subheader("Lithology Log")
+        # TABLE & AUTOFILL
+        st.subheader("Lithology Entry")
         if st.button("⚡ Auto-Fill Bottom Depths"):
-            df = st.session_state.log_data
-            if len(df) > 1:
-                for i in range(len(df) - 1):
-                    df.at[i, 'Bottom Depth'] = df.at[i+1, 'Top Depth']
-                st.session_state.log_data = df
+            df_t = st.session_state.log_data.copy()
+            for i in range(len(df_t)-1):
+                if not pd.isna(df_t.at[i+1, 'Top Depth']):
+                    df_t.at[i, 'Bottom Depth'] = df_t.at[i+1, 'Top Depth']
+            st.session_state.log_data = df_t
+            st.rerun()
 
-        edited_df = st.data_editor(st.session_state.log_data, num_rows="dynamic", use_container_width=True)
-        st.session_state.log_data = edited_df
+        # Add a temporary status column for visual feedback
+        display_df = st.session_state.log_data.copy()
+        status_icons, error_list = get_validation_status(display_df)
+        display_df.insert(0, "Status", status_icons)
 
-        # ACTIONS
-        col1, col2, _ = st.columns([1, 1, 2])
-        with col1:
+        edited_df = st.data_editor(
+            display_df, 
+            num_rows="dynamic", 
+            use_container_width=True, 
+            hide_index=True,
+            key="editor_v2"
+        )
+        # Update session state (excluding the temporary Status column)
+        st.session_state.log_data = edited_df.drop(columns=["Status"])
+
+        # SUBMIT
+        c1, c2, _ = st.columns([1, 1, 2])
+        with c1:
             if st.button("Submit Log", type="primary", use_container_width=True):
-                errors = validate_log(edited_df)
-                if errors:
-                    for e in errors: st.error(e)
+                _, final_errors = get_validation_status(st.session_state.log_data)
+                if final_errors:
+                    for e in final_errors: st.error(e)
                 else:
-                    confirm_submit(selected_receipt, notes, edited_df)
+                    confirm_submit(selected_receipt, notes, st.session_state.log_data)
         with col2:
             if st.button("No Data", use_container_width=True):
                 confirm_no_data(selected_receipt)
-
-        # PREVIEW
-        st.markdown("---")
-        st.subheader("🔍 Session Preview")
-        if not st.session_state.output_df.empty:
-            st.dataframe(st.session_state.output_df.tail(5).iloc[::-1], use_container_width=True)
-        else:
-            st.caption("Submit a log to see a preview here.")
     else:
-        st.info("👈 Please upload the DWR Excel file in the sidebar to begin.")
+        st.info("Please upload the DWR Excel file in the sidebar.")
