@@ -21,7 +21,7 @@ Transcribing historical well logs from the DWR database is often a slow, error-p
 ## 🚀 How to Run
 1. **Clone the Repo:**
    ```bash
-   git clone [https://github.com/YOUR-USERNAME/dwr-log-transcriber.git](https://github.com/YOUR-USERNAME/dwr-log-transcriber.git)
+   git clone [https://github.com/dcarney314/dwr-log-transcriber.git](https://github.com/dcarney314/dwr-log-transcriber.git)
    cd dwr-log-transcriber
 2. **Install Dependencies**
    ```bash
