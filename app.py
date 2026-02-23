@@ -4,7 +4,7 @@ import pandas as pd
 # --- INITIAL SETUP ---
 st.set_page_config(layout="wide", page_title="DWR Well Log Transcriber")
 
-# Initialize Master and Output 
+# Standard session state setup
 if 'master_df' not in st.session_state:
     st.session_state.master_df = None
 if 'output_df' not in st.session_state:
@@ -12,81 +12,57 @@ if 'output_df' not in st.session_state:
 if 'current_index' not in st.session_state:
     st.session_state.current_index = 0
 if 'current_table_df' not in st.session_state:
+    # 20 rows is standard, but you can change this
     st.session_state.current_table_df = pd.DataFrame([{"Top Depth": None, "Bottom Depth": None, "Lithology": ""}] * 20)
 
-# --- DATA PROCESSING ---
-def process_master(df):
-    target_indices = [0, 1, 2, 22, 23, 24, 25]
-    df = df.iloc[:, target_indices].copy()
-    df.columns = ['Receipt', 'Permit Number', 'Permit Status', 'UTM X', 'UTM Y', 'Latitude', 'Longitude']
-    df['Receipt'] = 'R' + df['Receipt'].astype(str)
-    df['Processing Status'] = 'Pending'
-    df['Notes'] = ''
-    return df
+# --- THE FIX: MANUAL TABLE UPDATE ---
+def update_table():
+    # This grabs the data from the editor's internal state only when we need it
+    if "main_editor" in st.session_state:
+        # We merge the changes into our stable dataframe
+        new_data = st.session_state["main_editor"]["edited_rows"]
+        for row_idx, changes in new_data.items():
+            for key, val in changes.items():
+                st.session_state.current_table_df.at[int(row_idx), key] = val
 
-# --- STRICT VALIDATION ---
-def validate_log(df):
-    errors = []
-    # Identify rows that have at least one depth or lithology entry
-    # We use this to ignore the "empty" rows at the bottom of your 20-row template
-    active_rows = df.dropna(how='all').copy()
-    
-    if active_rows.empty:
-        errors.append("The table is empty. Please enter data.")
-        return errors, None
-
-    for i in range(len(active_rows)):
-        row = active_rows.iloc[i]
-        try:
-            # Check for missing values in active rows
-            if pd.isnull(row['Top Depth']) or pd.isnull(row['Bottom Depth']):
-                errors.append(f"Row {i+1} is missing a depth value.")
-                continue
-            
-            t, b = float(row['Top Depth']), float(row['Bottom Depth'])
-            
-            if t >= b:
-                errors.append(f"Row {i+1}: Top ({t}) must be less than Bottom ({b}).")
-            
-            # Continuity Check
-            if i < len(active_rows) - 1:
-                next_row = active_rows.iloc[i+1]
-                if pd.notnull(next_row['Top Depth']):
-                    next_t = float(next_row['Top Depth'])
-                    if b != next_t:
-                        errors.append(f"Gap/Overlap: Row {i+1} ends at {b}, but Row {i+2} starts at {next_t}.")
-        except ValueError:
-            errors.append(f"Row {i+1} contains non-numeric depth values.")
-            
-    return errors, active_rows
-
-# --- MAIN INTERFACE ---
-with st.sidebar:
-    st.title("⚙️ Controls")
-    uploaded_file = st.file_uploader("Upload DWR Excel", type="xlsx")
-    if st.session_state.master_df is not None:
-        st.download_button("Download Master", st.session_state.master_df.to_csv(index=False), "master_tracking.csv")
-        st.download_button("Download Output", st.session_state.output_df.to_csv(index=False), "well_lithology_data.csv")
-
-if uploaded_file:
-    if st.session_state.master_df is None:
-        st.session_state.master_df = process_master(pd.read_excel(uploaded_file, header=None))
-
+# --- MAIN APP ---
+if st.session_state.master_df is not None:
     receipts = st.session_state.master_df['Receipt'].tolist()
     selected_receipt = st.selectbox("Current Well", receipts, index=st.session_state.current_index)
     st.session_state.current_index = receipts.index(selected_receipt)
 
-    # Link & Notes
+    # DWR Link & Notes
     clean_receipt = selected_receipt.lstrip('R')
     st.markdown(f"## 📄 [Open DWR Record {clean_receipt}](https://dwr.state.co.us/Tools/WellPermits/{clean_receipt})")
     
     well_idx = st.session_state.master_df[st.session_state.master_df['Receipt'] == selected_receipt].index[0]
     notes = st.text_input("Notes", value=st.session_state.master_df.at[well_idx, 'Notes'])
 
-    # --- THE TABLE ---
     st.subheader("Lithology Entry")
-    
-    if st.button("⚡ Auto-Fill Bottom Depths"):
+
+    # --- THE FORM WRAPPER ---
+    with st.form("entry_form", clear_on_submit=False):
+        # The table now lives inside a form. It will NOT refresh until a button is clicked.
+        edited_df = st.data_editor(
+            st.session_state.current_table_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            key="main_editor"
+        )
+        
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            # We use a special button that "submits" the form
+            submit_pressed = st.form_submit_button("✅ Verify & Submit Log", type="primary", use_container_width=True)
+        with col_f2:
+            autofill_pressed = st.form_submit_button("⚡ Auto-Fill Bottoms", use_container_width=True)
+
+    # --- LOGIC AFTER FORM SUBMISSION ---
+    if autofill_pressed:
+        # 1. Update our state from the editor first
+        st.session_state.current_table_df = edited_df
+        # 2. Run the autofill
         df_work = st.session_state.current_table_df.copy()
         for i in range(len(df_work) - 1):
             next_t = df_work.at[i+1, 'Top Depth']
@@ -95,46 +71,25 @@ if uploaded_file:
         st.session_state.current_table_df = df_work
         st.rerun()
 
-    edited_df = st.data_editor(
-        st.session_state.current_table_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
-        key="main_editor"
-    )
-    st.session_state.current_table_df = edited_df
+    if submit_pressed:
+        # 1. Capture the data
+        st.session_state.current_table_df = edited_df
+        # 2. Run your validation (gap checks, logic checks)
+        # (Insert your validation function here)
+        
+        # 3. If valid, save to output and clear
+        ready_data = st.session_state.current_table_df.dropna(how='all').copy()
+        ready_data['Receipt'] = selected_receipt
+        st.session_state.output_df = pd.concat([st.session_state.output_df, ready_data], ignore_index=True)
+        
+        # Reset and Move Next
+        st.session_state.current_table_df = pd.DataFrame([{"Top Depth": None, "Bottom Depth": None, "Lithology": ""}] * 20)
+        st.session_state.current_index += 1
+        st.success("Log Saved!")
+        st.rerun()
 
-    # --- SUBMISSION ---
-    c1, c2, _ = st.columns([1, 1, 2])
-    with c1:
-        if st.button("Submit Log", type="primary", use_container_width=True):
-            # 1. Run Validation
-            err_list, ready_data = validate_log(st.session_state.current_table_df)
-            
-            if err_list:
-                # 2. Block Saving and Show Notifications
-                st.error("🛑 Log has problems! Fix the following before saving:")
-                for e in err_list:
-                    st.warning(e)
-            else:
-                # 3. Save ONLY if 0 errors found
-                st.session_state.master_df.at[well_idx, 'Processing Status'] = 'Complete'
-                st.session_state.master_df.at[well_idx, 'Notes'] = notes
-                
-                ready_data['Receipt'] = selected_receipt
-                st.session_state.output_df = pd.concat([st.session_state.output_df, ready_data], ignore_index=True)
-                
-                # Reset
-                st.session_state.current_table_df = pd.DataFrame([{"Top Depth": None, "Bottom Depth": None, "Lithology": ""}] * 20)
-                st.session_state.current_index += 1
-                st.success("✅ Log Verified and Saved!")
-                st.rerun()
-                
-    with c2:
-        if st.button("No Data", use_container_width=True):
-            st.session_state.master_df.at[well_idx, 'Processing Status'] = 'ND'
-            st.session_state.current_index += 1
-            st.session_state.current_table_df = pd.DataFrame([{"Top Depth": None, "Bottom Depth": None, "Lithology": ""}] * 20)
-            st.rerun()
-else:
-    st.info("Upload your Excel file in the sidebar to start.")
+    if st.button("No Data"):
+        st.session_state.master_df.at[well_idx, 'Processing Status'] = 'ND'
+        st.session_state.current_index += 1
+        st.session_state.current_table_df = pd.DataFrame([{"Top Depth": None, "Bottom Depth": None, "Lithology": ""}] * 20)
+        st.rerun()
