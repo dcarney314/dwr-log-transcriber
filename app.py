@@ -36,6 +36,13 @@ if 'current_table_df' not in st.session_state:
 if 'editor_key' not in st.session_state:
     st.session_state.editor_key = 0
 
+# Undo stack — each entry is a dict with keys:
+#   'current_index', 'log_rows', 'master_row', 'table_df', 'notes', 'status'
+if 'undo_stack' not in st.session_state:
+    st.session_state.undo_stack = []
+
+
+# ---- HELPERS ----
 
 def _apply_editor_state():
     """Merge pending data_editor widget changes into current_table_df on every rerun."""
@@ -66,7 +73,6 @@ def _apply_editor_state():
 
 
 def safe_get_col(row, col_idx):
-    """Safely retrieve a value from a row by positional index."""
     try:
         return row.iloc[col_idx]
     except IndexError:
@@ -74,7 +80,6 @@ def safe_get_col(row, col_idx):
 
 
 def add_prefix(value, prefix):
-    """Prepend a prefix to a value as a string, avoiding duplicates."""
     s = str(value).strip()
     if not s or s.lower() == 'nan':
         return ""
@@ -94,7 +99,68 @@ def to_csv_bytes(df):
     return buf.getvalue().encode("utf-8")
 
 
-# --- SYNC EDITOR STATE ON EVERY RUN (prevents Enter-key data loss) ---
+def is_row_empty(row):
+    """True if a table row has no meaningful data in any field."""
+    return (
+        (pd.isnull(row['Top Depth'])    or str(row['Top Depth']).strip()    == "") and
+        (pd.isnull(row['Bottom Depth']) or str(row['Bottom Depth']).strip() == "") and
+        (pd.isnull(row['Lithology'])    or str(row['Lithology']).strip()    == "")
+    )
+
+
+def validate_and_trim(table_df):
+    """
+    1. Strip trailing all-empty rows.
+    2. Validate the remaining rows.
+    Returns (trimmed_df, errors_list).
+    Errors are raised for interior empty rows, depth inversions, and gaps/overlaps.
+    Empty trailing rows are silently dropped.
+    """
+    df = table_df.copy().reset_index(drop=True)
+
+    # Drop trailing empty rows
+    last_data_idx = -1
+    for i in range(len(df) - 1, -1, -1):
+        if not is_row_empty(df.iloc[i]):
+            last_data_idx = i
+            break
+
+    if last_data_idx == -1:
+        return pd.DataFrame(columns=df.columns), ["No data entered — please fill in at least one row."]
+
+    df = df.iloc[:last_data_idx + 1].reset_index(drop=True)
+
+    errors = []
+
+    for i, row in df.iterrows():
+        if is_row_empty(row):
+            errors.append(f"Row {i+1}: empty row in the middle of the log — please fill or remove it.")
+            continue
+        top_missing = pd.isnull(row['Top Depth'])    or str(row['Top Depth']).strip()    == ""
+        bot_missing = pd.isnull(row['Bottom Depth']) or str(row['Bottom Depth']).strip() == ""
+        if top_missing:
+            errors.append(f"Row {i+1}: missing Top Depth.")
+        if bot_missing:
+            errors.append(f"Row {i+1}: missing Bottom Depth.")
+        if not top_missing and not bot_missing:
+            if float(row['Top Depth']) >= float(row['Bottom Depth']):
+                errors.append(f"Row {i+1}: Top Depth ({row['Top Depth']}) must be less than Bottom Depth ({row['Bottom Depth']}).")
+
+    # Gap / overlap check on consecutive valid rows
+    valid = df.dropna(subset=['Top Depth', 'Bottom Depth']).reset_index(drop=True)
+    for i in range(len(valid) - 1):
+        this_bot = float(valid.at[i,   'Bottom Depth'])
+        next_top = float(valid.at[i+1, 'Top Depth'])
+        if this_bot != next_top:
+            errors.append(
+                f"Gap or overlap between rows {i+1} and {i+2} "
+                f"({this_bot} → {next_top})."
+            )
+
+    return df, errors
+
+
+# --- SYNC EDITOR STATE ON EVERY RUN ---
 _apply_editor_state()
 
 
@@ -103,21 +169,34 @@ _apply_editor_state()
 # =========================================================
 if st.session_state.master_df is None:
     st.title("🚰 DWR Well Log Transcriber")
-    st.info(
-        "Upload your master spreadsheet to begin. "
-        "Receipt must be in column 1, Permit Number in column 2, "
-        "Permit Status in column 3, and coordinates in columns 23–26."
+
+    st.markdown("### 📥 Import Colorado DWR Data")
+    st.markdown(
+        """
+1. **Go to the DWR Well Permit Search:** [dwr.state.co.us/Tools/WellPermits](https://dwr.state.co.us/Tools/WellPermits)
+2. **Filter wells** by region, permit status, latitude/longitude, or other attributes as needed.
+3. **Select all and copy** the entire well attribute table from the results page.
+4. **Paste into a blank Excel workbook** (.xlsx) — no header row, data starting in cell A1.
+5. **Save the file**, then upload it below.
+        """
     )
+
+    st.info(
+        "**Expected column layout:** Receipt (col 1) · Permit Number (col 2) · "
+        "Permit Status (col 3) · UTM X (col 23) · UTM Y (col 24) · "
+        "Latitude (col 25) · Longitude (col 26). "
+        "No header row should be present in the file."
+    )
+
     uploaded = st.file_uploader("Upload Master File (.xlsx or .csv)", type=["xlsx", "csv"])
     if uploaded:
         if uploaded.name.endswith(".csv"):
-            df_raw = pd.read_csv(uploaded, dtype=str, header=0)
+            df_raw = pd.read_csv(uploaded, dtype=str, header=None)
         else:
-            df_raw = pd.read_excel(uploaded, dtype=str, header=0)
+            df_raw = pd.read_excel(uploaded, dtype=str, header=None)
 
         df_raw.fillna("", inplace=True)
 
-        # Ensure helper columns exist
         if 'Notes' not in df_raw.columns:
             df_raw['Notes'] = ""
         if 'Processing Status' not in df_raw.columns:
@@ -132,11 +211,9 @@ if st.session_state.master_df is None:
 else:
     df = st.session_state.master_df
 
-    # Build receipt display labels (R-prefixed) from the positional column
     raw_receipts     = [str(df.iloc[i, COL_RECEIPT]).strip() for i in range(len(df))]
     display_receipts = [add_prefix(r, "R") for r in raw_receipts]
 
-    # Clamp index
     idx = min(st.session_state.current_index, len(display_receipts) - 1)
     st.session_state.current_index = idx
 
@@ -150,7 +227,6 @@ else:
 
         st.divider()
         st.header("Export Outputs")
-
         st.download_button(
             label="⬇️ Download Log Output",
             data=to_csv_bytes(st.session_state.log_output_df),
@@ -171,23 +247,19 @@ else:
         st.divider()
         if st.button("🔄 Load New Master File", use_container_width=True):
             for key in ['master_df', 'log_output_df', 'master_output_df',
-                        'current_index', 'current_table_df', 'editor_key']:
+                        'current_index', 'current_table_df', 'editor_key', 'undo_stack']:
                 del st.session_state[key]
             st.rerun()
 
     # --- Well Selector ---
-    selected_display = st.selectbox(
-        "Current Well",
-        display_receipts,
-        index=idx,
-    )
+    selected_display = st.selectbox("Current Well", display_receipts, index=idx)
     st.session_state.current_index = display_receipts.index(selected_display)
 
     well_row     = df.iloc[st.session_state.current_index]
-    raw_receipt  = raw_receipts[st.session_state.current_index]   # plain number, used in URL
-    disp_receipt = display_receipts[st.session_state.current_index]  # R-prefixed
+    raw_receipt  = raw_receipts[st.session_state.current_index]
+    disp_receipt = display_receipts[st.session_state.current_index]
+    master_idx   = df.index[st.session_state.current_index]
 
-    # DWR hyperlink (raw number, no R prefix)
     st.markdown(
         f"## 📄 [Open DWR Record {disp_receipt}]"
         f"(https://dwr.state.co.us/Tools/WellPermits/{raw_receipt})"
@@ -197,17 +269,35 @@ else:
     permit_status = safe_get_col(well_row, COL_PERMIT_STATUS)
     st.caption(f"Permit: {add_prefix(permit_raw, 'P')}  |  Status: {permit_status}")
 
-    # Notes
-    master_idx = df.index[st.session_state.current_index]
-    notes_val  = df.at[master_idx, 'Notes']
-    notes      = st.text_input("Notes", value=notes_val,
-                               key=f"notes_{st.session_state.current_index}")
+    notes_val = df.at[master_idx, 'Notes']
+    notes     = st.text_input("Notes", value=notes_val,
+                              key=f"notes_{st.session_state.current_index}")
+
+    # --- No Data (above lithology table) ---
+    col_nd, col_undo = st.columns([1, 1])
+    with col_nd:
+        no_data_pressed = st.button("⛔ No Data", use_container_width=True)
+    with col_undo:
+        undo_pressed = st.button(
+            "↩️ Undo Last Entry",
+            use_container_width=True,
+            disabled=len(st.session_state.undo_stack) == 0,
+        )
 
     st.subheader("Lithology Entry")
 
     editor_key = f"main_editor_{st.session_state.editor_key}"
 
     with st.form("entry_form", clear_on_submit=False):
+        # Top action row
+        top_c1, top_c2, top_c3 = st.columns([2, 2, 3])
+        with top_c1:
+            submit_pressed_top   = st.form_submit_button("✅ Verify & Submit Log",
+                                                         type="primary", use_container_width=True)
+        with top_c2:
+            autofill_pressed_top = st.form_submit_button("⚡ Auto-Fill Bottoms (top)",
+                                                         use_container_width=True)
+
         st.data_editor(
             st.session_state.current_table_df,
             num_rows="dynamic",
@@ -221,13 +311,17 @@ else:
             },
         )
 
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            submit_pressed   = st.form_submit_button("✅ Verify & Submit Log",
-                                                     type="primary", use_container_width=True)
-        with col_f2:
-            autofill_pressed = st.form_submit_button("⚡ Auto-Fill Bottoms",
-                                                     use_container_width=True)
+        # Bottom action row
+        bot_c1, bot_c2, bot_c3 = st.columns([2, 2, 3])
+        with bot_c1:
+            submit_pressed_bot   = st.form_submit_button("✅ Verify & Submit Log ",
+                                                         type="primary", use_container_width=True)
+        with bot_c2:
+            autofill_pressed_bot = st.form_submit_button("⚡ Auto-Fill Bottoms (bottom)",
+                                                         use_container_width=True)
+
+    submit_pressed   = submit_pressed_top   or submit_pressed_bot
+    autofill_pressed = autofill_pressed_top or autofill_pressed_bot
 
     # --- Auto-Fill ---
     if autofill_pressed:
@@ -240,48 +334,34 @@ else:
         st.session_state.editor_key += 1
         st.rerun()
 
-    # --- Submit & Validate ---
+    # --- Submit ---
     if submit_pressed:
-        df_check = st.session_state.current_table_df.dropna(
-            subset=['Top Depth', 'Bottom Depth', 'Lithology'], how='all'
-        ).copy()
-
-        errors = []
-        for i, row in df_check.iterrows():
-            if pd.isnull(row['Top Depth']) or row['Top Depth'] == "":
-                errors.append(f"Row {i+1}: missing Top Depth.")
-            elif pd.isnull(row['Bottom Depth']) or row['Bottom Depth'] == "":
-                errors.append(f"Row {i+1}: missing Bottom Depth.")
-            elif float(row['Top Depth']) >= float(row['Bottom Depth']):
-                errors.append(f"Row {i+1}: Top Depth must be less than Bottom Depth.")
-
-        valid_rows = df_check.dropna(subset=['Top Depth', 'Bottom Depth']).reset_index(drop=True)
-        for i in range(len(valid_rows) - 1):
-            this_bot = float(valid_rows.at[i,   'Bottom Depth'])
-            next_top = float(valid_rows.at[i+1, 'Top Depth'])
-            if this_bot != next_top:
-                errors.append(
-                    f"Gap or overlap between rows {i+1} and {i+2} "
-                    f"({this_bot} → {next_top})."
-                )
+        trimmed_df, errors = validate_and_trim(st.session_state.current_table_df)
 
         if errors:
             for e in errors:
                 st.error(e)
         else:
-            # Update master_df status
+            # Save undo snapshot BEFORE committing
+            st.session_state.undo_stack.append({
+                'prev_index':    st.session_state.current_index,
+                'table_df':      trimmed_df.copy(),
+                'notes':         notes,
+                'status':        'Logged',
+                'log_rows_n':    len(trimmed_df),
+                'master_rows_n': 1,
+            })
+
             st.session_state.master_df.at[master_idx, 'Notes']             = notes
             st.session_state.master_df.at[master_idx, 'Processing Status'] = 'Logged'
 
-            # Log output — one row per lithology interval
-            log_rows             = df_check.copy()
-            log_rows['Receipt']  = disp_receipt
-            log_rows             = log_rows[['Receipt', 'Top Depth', 'Bottom Depth', 'Lithology']]
+            log_rows            = trimmed_df.copy()
+            log_rows['Receipt'] = disp_receipt
+            log_rows            = log_rows[['Receipt', 'Top Depth', 'Bottom Depth', 'Lithology']]
             st.session_state.log_output_df = pd.concat(
                 [st.session_state.log_output_df, log_rows], ignore_index=True
             )
 
-            # Master output — one row per well
             new_master_row = pd.DataFrame([{
                 'Receipt':           disp_receipt,
                 'Permit Number':     add_prefix(safe_get_col(well_row, COL_PERMIT), "P"),
@@ -302,7 +382,17 @@ else:
             st.rerun()
 
     # --- No Data ---
-    if st.button("⛔ No Data", use_container_width=False):
+    if no_data_pressed:
+        # Save undo snapshot
+        st.session_state.undo_stack.append({
+            'prev_index':    st.session_state.current_index,
+            'table_df':      st.session_state.current_table_df.copy(),
+            'notes':         notes,
+            'status':        'ND',
+            'log_rows_n':    0,
+            'master_rows_n': 1,
+        })
+
         st.session_state.master_df.at[master_idx, 'Notes']             = notes
         st.session_state.master_df.at[master_idx, 'Processing Status'] = 'ND'
 
@@ -322,6 +412,35 @@ else:
 
         reset_table()
         st.session_state.current_index += 1
+        st.rerun()
+
+    # --- Undo ---
+    if undo_pressed and st.session_state.undo_stack:
+        snap = st.session_state.undo_stack.pop()
+
+        # Restore index
+        st.session_state.current_index = snap['prev_index']
+
+        # Restore the table so the user can re-edit
+        st.session_state.current_table_df = snap['table_df'].copy()
+        st.session_state.editor_key += 1
+
+        # Roll back master_output_df (remove last N master rows)
+        n_master = snap['master_rows_n']
+        if n_master > 0 and len(st.session_state.master_output_df) >= n_master:
+            st.session_state.master_output_df = st.session_state.master_output_df.iloc[:-n_master].reset_index(drop=True)
+
+        # Roll back log_output_df (remove last N log rows)
+        n_log = snap['log_rows_n']
+        if n_log > 0 and len(st.session_state.log_output_df) >= n_log:
+            st.session_state.log_output_df = st.session_state.log_output_df.iloc[:-n_log].reset_index(drop=True)
+
+        # Restore Processing Status in master_df to blank
+        undo_master_idx = df.index[snap['prev_index']]
+        st.session_state.master_df.at[undo_master_idx, 'Processing Status'] = ''
+        st.session_state.master_df.at[undo_master_idx, 'Notes']             = snap['notes']
+
+        st.success("Last entry undone. You can re-edit and resubmit.")
         st.rerun()
 
     # --- Output Previews ---
