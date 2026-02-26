@@ -295,7 +295,7 @@ else:
             submit_pressed_top   = st.form_submit_button("✅ Verify & Submit Log",
                                                          type="primary", use_container_width=True)
         with top_c2:
-            autofill_pressed_top = st.form_submit_button("⚡ Auto-Fill Bottom Depths",
+            autofill_pressed_top = st.form_submit_button("⚡ Auto-Fill Bottom Depths ",
                                                          use_container_width=True)
 
         st.data_editor(
