@@ -295,7 +295,7 @@ else:
             submit_pressed_top   = st.form_submit_button("✅ Verify & Submit Log",
                                                          type="primary", use_container_width=True)
         with top_c2:
-            autofill_pressed_top = st.form_submit_button("⚡ Auto-Fill Bottoms (top)",
+            autofill_pressed_top = st.form_submit_button("⚡ Auto-Fill Bottom Depths",
                                                          use_container_width=True)
 
         st.data_editor(
@@ -317,7 +317,7 @@ else:
             submit_pressed_bot   = st.form_submit_button("✅ Verify & Submit Log ",
                                                          type="primary", use_container_width=True)
         with bot_c2:
-            autofill_pressed_bot = st.form_submit_button("⚡ Auto-Fill Bottoms (bottom)",
+            autofill_pressed_bot = st.form_submit_button("⚡ Auto-Fill Bottom Depths",
                                                          use_container_width=True)
 
     submit_pressed   = submit_pressed_top   or submit_pressed_bot
