@@ -34,7 +34,7 @@ Transcribing historical well logs from the DWR database is often a slow, error-p
 
 ## 📋 Input File Format
 
-The input file should be a raw export copied from the well attribute table in [DWR Well Permit Search](https://dwr.state.co.us/Tools/WellPermits) pasted directly into a blank Excel workbook — **no header row**. The app reads the following columns by position:
+The input file should be the data copied from the well attribute table in [DWR Well Permit Search](https://dwr.state.co.us/Tools/WellPermits) and pasted directly into a blank Excel workbook — **no header row**. The app reads the following columns by position:
 
 | Column | Field |
 |---|---|
