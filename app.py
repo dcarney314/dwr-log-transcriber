@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import io
 
 # --- INITIAL SETUP ---
 st.set_page_config(layout="wide", page_title="DWR Well Log Transcriber")
@@ -8,44 +9,53 @@ EMPTY_TABLE = lambda: pd.DataFrame(
     [{"Top Depth": None, "Bottom Depth": None, "Lithology": ""}] * 20
 )
 
+# Column index constants (0-based) for the master input file
+COL_RECEIPT       = 0   # Column 1
+COL_PERMIT        = 1   # Column 2
+COL_PERMIT_STATUS = 2   # Column 3
+COL_UTM_X         = 22  # Column 23
+COL_UTM_Y         = 23  # Column 24
+COL_LAT           = 24  # Column 25
+COL_LON           = 25  # Column 26
+
 if 'master_df' not in st.session_state:
     st.session_state.master_df = None
-if 'output_df' not in st.session_state:
-    st.session_state.output_df = pd.DataFrame(columns=['Receipt', 'Top Depth', 'Bottom Depth', 'Lithology'])
+if 'log_output_df' not in st.session_state:
+    st.session_state.log_output_df = pd.DataFrame(
+        columns=['Receipt', 'Top Depth', 'Bottom Depth', 'Lithology']
+    )
+if 'master_output_df' not in st.session_state:
+    st.session_state.master_output_df = pd.DataFrame(
+        columns=['Receipt', 'Permit Number', 'UTM X', 'UTM Y',
+                 'Latitude', 'Longitude', 'Notes', 'Processing Status']
+    )
 if 'current_index' not in st.session_state:
     st.session_state.current_index = 0
 if 'current_table_df' not in st.session_state:
     st.session_state.current_table_df = EMPTY_TABLE()
 if 'editor_key' not in st.session_state:
-    # Incrementing this key forces the editor to fully re-mount (used on submit/reset)
     st.session_state.editor_key = 0
 
 
 def _apply_editor_state():
-    """
-    Read the raw widget state from the data_editor and merge any edits
-    into current_table_df. Called at the TOP of every render so that
-    Enter-key reruns never discard work.
-    """
+    """Merge pending data_editor widget changes into current_table_df on every rerun."""
     key = f"main_editor_{st.session_state.editor_key}"
     if key not in st.session_state:
         return
     widget_state = st.session_state[key]
 
-    # Apply edited rows
     for row_idx_str, changes in widget_state.get("edited_rows", {}).items():
         row_idx = int(row_idx_str)
         for col, val in changes.items():
-            st.session_state.current_table_df.at[row_idx, col] = val
+            if row_idx < len(st.session_state.current_table_df):
+                st.session_state.current_table_df.at[row_idx, col] = val
 
-    # Apply added rows
     for new_row in widget_state.get("added_rows", []):
         st.session_state.current_table_df = pd.concat(
             [st.session_state.current_table_df, pd.DataFrame([new_row])],
             ignore_index=True
         )
 
-    # Apply deleted rows
     deleted = widget_state.get("deleted_rows", [])
     if deleted:
         st.session_state.current_table_df = (
@@ -55,26 +65,146 @@ def _apply_editor_state():
         )
 
 
-# --- SYNC EDITOR STATE ON EVERY RUN (the critical fix) ---
+def safe_get_col(row, col_idx):
+    """Safely retrieve a value from a row by positional index."""
+    try:
+        return row.iloc[col_idx]
+    except IndexError:
+        return ""
+
+
+def add_prefix(value, prefix):
+    """Prepend a prefix to a value as a string, avoiding duplicates."""
+    s = str(value).strip()
+    if not s or s.lower() == 'nan':
+        return ""
+    if not s.startswith(prefix):
+        return prefix + s
+    return s
+
+
+def reset_table():
+    st.session_state.current_table_df = EMPTY_TABLE()
+    st.session_state.editor_key += 1
+
+
+def to_csv_bytes(df):
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+
+# --- SYNC EDITOR STATE ON EVERY RUN (prevents Enter-key data loss) ---
 _apply_editor_state()
 
 
-# --- MAIN APP ---
-if st.session_state.master_df is not None:
-    receipts = st.session_state.master_df['Receipt'].tolist()
-    selected_receipt = st.selectbox("Current Well", receipts, index=st.session_state.current_index)
-    st.session_state.current_index = receipts.index(selected_receipt)
+# =========================================================
+# UPLOAD SCREEN
+# =========================================================
+if st.session_state.master_df is None:
+    st.title("🚰 DWR Well Log Transcriber")
+    st.info(
+        "Upload your master spreadsheet to begin. "
+        "Receipt must be in column 1, Permit Number in column 2, "
+        "Permit Status in column 3, and coordinates in columns 23–26."
+    )
+    uploaded = st.file_uploader("Upload Master File (.xlsx or .csv)", type=["xlsx", "csv"])
+    if uploaded:
+        if uploaded.name.endswith(".csv"):
+            df_raw = pd.read_csv(uploaded, dtype=str, header=0)
+        else:
+            df_raw = pd.read_excel(uploaded, dtype=str, header=0)
 
-    # DWR Link & Notes
-    clean_receipt = selected_receipt.lstrip('R')
-    st.markdown(f"## 📄 [Open DWR Record {clean_receipt}](https://dwr.state.co.us/Tools/WellPermits/{clean_receipt})")
+        df_raw.fillna("", inplace=True)
 
-    well_idx = st.session_state.master_df[st.session_state.master_df['Receipt'] == selected_receipt].index[0]
-    notes = st.text_input("Notes", value=st.session_state.master_df.at[well_idx, 'Notes'])
+        # Ensure helper columns exist
+        if 'Notes' not in df_raw.columns:
+            df_raw['Notes'] = ""
+        if 'Processing Status' not in df_raw.columns:
+            df_raw['Processing Status'] = ""
+
+        st.session_state.master_df = df_raw
+        st.rerun()
+
+# =========================================================
+# MAIN APP
+# =========================================================
+else:
+    df = st.session_state.master_df
+
+    # Build receipt display labels (R-prefixed) from the positional column
+    raw_receipts     = [str(df.iloc[i, COL_RECEIPT]).strip() for i in range(len(df))]
+    display_receipts = [add_prefix(r, "R") for r in raw_receipts]
+
+    # Clamp index
+    idx = min(st.session_state.current_index, len(display_receipts) - 1)
+    st.session_state.current_index = idx
+
+    # --- Sidebar ---
+    with st.sidebar:
+        st.header("Progress")
+        total  = len(display_receipts)
+        logged = len(st.session_state.master_output_df)
+        st.metric("Wells Processed", f"{logged} / {total}")
+        st.progress(logged / total if total > 0 else 0)
+
+        st.divider()
+        st.header("Export Outputs")
+
+        st.download_button(
+            label="⬇️ Download Log Output",
+            data=to_csv_bytes(st.session_state.log_output_df),
+            file_name="log_output.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=st.session_state.log_output_df.empty,
+        )
+        st.download_button(
+            label="⬇️ Download Master Output",
+            data=to_csv_bytes(st.session_state.master_output_df),
+            file_name="master_output.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=st.session_state.master_output_df.empty,
+        )
+
+        st.divider()
+        if st.button("🔄 Load New Master File", use_container_width=True):
+            for key in ['master_df', 'log_output_df', 'master_output_df',
+                        'current_index', 'current_table_df', 'editor_key']:
+                del st.session_state[key]
+            st.rerun()
+
+    # --- Well Selector ---
+    selected_display = st.selectbox(
+        "Current Well",
+        display_receipts,
+        index=idx,
+    )
+    st.session_state.current_index = display_receipts.index(selected_display)
+
+    well_row     = df.iloc[st.session_state.current_index]
+    raw_receipt  = raw_receipts[st.session_state.current_index]   # plain number, used in URL
+    disp_receipt = display_receipts[st.session_state.current_index]  # R-prefixed
+
+    # DWR hyperlink (raw number, no R prefix)
+    st.markdown(
+        f"## 📄 [Open DWR Record {disp_receipt}]"
+        f"(https://dwr.state.co.us/Tools/WellPermits/{raw_receipt})"
+    )
+
+    permit_raw    = safe_get_col(well_row, COL_PERMIT)
+    permit_status = safe_get_col(well_row, COL_PERMIT_STATUS)
+    st.caption(f"Permit: {add_prefix(permit_raw, 'P')}  |  Status: {permit_status}")
+
+    # Notes
+    master_idx = df.index[st.session_state.current_index]
+    notes_val  = df.at[master_idx, 'Notes']
+    notes      = st.text_input("Notes", value=notes_val,
+                               key=f"notes_{st.session_state.current_index}")
 
     st.subheader("Lithology Entry")
 
-    # Unique key per editor "session" — incrementing it on reset forces a clean mount
     editor_key = f"main_editor_{st.session_state.editor_key}"
 
     with st.form("entry_form", clear_on_submit=False):
@@ -85,22 +215,21 @@ if st.session_state.master_df is not None:
             hide_index=True,
             key=editor_key,
             column_config={
-                "Top Depth": st.column_config.NumberColumn("Top Depth", min_value=0),
+                "Top Depth":    st.column_config.NumberColumn("Top Depth",    min_value=0),
                 "Bottom Depth": st.column_config.NumberColumn("Bottom Depth", min_value=0),
-                "Lithology": st.column_config.TextColumn("Lithology"),
-            }
+                "Lithology":    st.column_config.TextColumn("Lithology"),
+            },
         )
 
         col_f1, col_f2 = st.columns(2)
         with col_f1:
-            submit_pressed = st.form_submit_button("✅ Verify & Submit Log", type="primary", use_container_width=True)
+            submit_pressed   = st.form_submit_button("✅ Verify & Submit Log",
+                                                     type="primary", use_container_width=True)
         with col_f2:
-            autofill_pressed = st.form_submit_button("⚡ Auto-Fill Bottoms", use_container_width=True)
+            autofill_pressed = st.form_submit_button("⚡ Auto-Fill Bottoms",
+                                                     use_container_width=True)
 
-    # --- BUTTON LOGIC ---
-    # Note: _apply_editor_state() already ran at the top of this rerun,
-    # so current_table_df is always up-to-date here.
-
+    # --- Auto-Fill ---
     if autofill_pressed:
         df_work = st.session_state.current_table_df.copy()
         for i in range(len(df_work) - 1):
@@ -108,65 +237,102 @@ if st.session_state.master_df is not None:
             if pd.notnull(next_t) and next_t != "":
                 df_work.at[i, 'Bottom Depth'] = next_t
         st.session_state.current_table_df = df_work
-        # Bump the key so the editor re-mounts with the new autofilled data
         st.session_state.editor_key += 1
         st.rerun()
 
+    # --- Submit & Validate ---
     if submit_pressed:
-        # --- Validation ---
-        df_check = st.session_state.current_table_df.dropna(subset=['Top Depth', 'Bottom Depth', 'Lithology'], how='all')
+        df_check = st.session_state.current_table_df.dropna(
+            subset=['Top Depth', 'Bottom Depth', 'Lithology'], how='all'
+        ).copy()
+
         errors = []
         for i, row in df_check.iterrows():
-            if pd.isnull(row['Top Depth']) or pd.isnull(row['Bottom Depth']):
-                errors.append(f"Row {i+1}: missing Top or Bottom Depth.")
-            elif row['Top Depth'] >= row['Bottom Depth']:
+            if pd.isnull(row['Top Depth']) or row['Top Depth'] == "":
+                errors.append(f"Row {i+1}: missing Top Depth.")
+            elif pd.isnull(row['Bottom Depth']) or row['Bottom Depth'] == "":
+                errors.append(f"Row {i+1}: missing Bottom Depth.")
+            elif float(row['Top Depth']) >= float(row['Bottom Depth']):
                 errors.append(f"Row {i+1}: Top Depth must be less than Bottom Depth.")
-        # Check for gaps/overlaps between consecutive rows
+
         valid_rows = df_check.dropna(subset=['Top Depth', 'Bottom Depth']).reset_index(drop=True)
         for i in range(len(valid_rows) - 1):
-            this_bot = valid_rows.at[i, 'Bottom Depth']
-            next_top = valid_rows.at[i + 1, 'Top Depth']
+            this_bot = float(valid_rows.at[i,   'Bottom Depth'])
+            next_top = float(valid_rows.at[i+1, 'Top Depth'])
             if this_bot != next_top:
-                errors.append(f"Gap or overlap between rows {i+1} and {i+2} ({this_bot} → {next_top}).")
+                errors.append(
+                    f"Gap or overlap between rows {i+1} and {i+2} "
+                    f"({this_bot} → {next_top})."
+                )
 
         if errors:
             for e in errors:
                 st.error(e)
         else:
-            ready_data = df_check.copy()
-            ready_data['Receipt'] = selected_receipt
-            st.session_state.output_df = pd.concat(
-                [st.session_state.output_df, ready_data], ignore_index=True
+            # Update master_df status
+            st.session_state.master_df.at[master_idx, 'Notes']             = notes
+            st.session_state.master_df.at[master_idx, 'Processing Status'] = 'Logged'
+
+            # Log output — one row per lithology interval
+            log_rows             = df_check.copy()
+            log_rows['Receipt']  = disp_receipt
+            log_rows             = log_rows[['Receipt', 'Top Depth', 'Bottom Depth', 'Lithology']]
+            st.session_state.log_output_df = pd.concat(
+                [st.session_state.log_output_df, log_rows], ignore_index=True
             )
-            # Reset table and advance
-            st.session_state.current_table_df = EMPTY_TABLE()
-            st.session_state.editor_key += 1
+
+            # Master output — one row per well
+            new_master_row = pd.DataFrame([{
+                'Receipt':           disp_receipt,
+                'Permit Number':     add_prefix(safe_get_col(well_row, COL_PERMIT), "P"),
+                'UTM X':             safe_get_col(well_row, COL_UTM_X),
+                'UTM Y':             safe_get_col(well_row, COL_UTM_Y),
+                'Latitude':          safe_get_col(well_row, COL_LAT),
+                'Longitude':         safe_get_col(well_row, COL_LON),
+                'Notes':             notes,
+                'Processing Status': 'Logged',
+            }])
+            st.session_state.master_output_df = pd.concat(
+                [st.session_state.master_output_df, new_master_row], ignore_index=True
+            )
+
+            reset_table()
             st.session_state.current_index += 1
-            st.success("Log Saved!")
+            st.success("Log saved! Moving to next well.")
             st.rerun()
 
-    if st.button("No Data"):
-        st.session_state.master_df.at[well_idx, 'Processing Status'] = 'ND'
+    # --- No Data ---
+    if st.button("⛔ No Data", use_container_width=False):
+        st.session_state.master_df.at[master_idx, 'Notes']             = notes
+        st.session_state.master_df.at[master_idx, 'Processing Status'] = 'ND'
+
+        new_master_row = pd.DataFrame([{
+            'Receipt':           disp_receipt,
+            'Permit Number':     add_prefix(safe_get_col(well_row, COL_PERMIT), "P"),
+            'UTM X':             safe_get_col(well_row, COL_UTM_X),
+            'UTM Y':             safe_get_col(well_row, COL_UTM_Y),
+            'Latitude':          safe_get_col(well_row, COL_LAT),
+            'Longitude':         safe_get_col(well_row, COL_LON),
+            'Notes':             notes,
+            'Processing Status': 'ND',
+        }])
+        st.session_state.master_output_df = pd.concat(
+            [st.session_state.master_output_df, new_master_row], ignore_index=True
+        )
+
+        reset_table()
         st.session_state.current_index += 1
-        st.session_state.current_table_df = EMPTY_TABLE()
-        st.session_state.editor_key += 1
         st.rerun()
 
-    # --- Output Preview ---
-    if not st.session_state.output_df.empty:
-        with st.expander("📊 Output Preview", expanded=False):
-            st.dataframe(st.session_state.output_df, use_container_width=True)
-
-else:
-    st.info("Upload a master spreadsheet to begin. Your file should contain a 'Receipt' column.")
-    uploaded = st.file_uploader("Upload Master File (.xlsx or .csv)", type=["xlsx", "csv"])
-    if uploaded:
-        if uploaded.name.endswith(".csv"):
-            st.session_state.master_df = pd.read_csv(uploaded, dtype=str)
+    # --- Output Previews ---
+    with st.expander("📋 Log Output Preview", expanded=False):
+        if st.session_state.log_output_df.empty:
+            st.caption("No logs submitted yet.")
         else:
-            st.session_state.master_df = pd.read_excel(uploaded, dtype=str)
-        # Ensure required columns exist
-        for col in ['Receipt', 'Notes', 'Processing Status']:
-            if col not in st.session_state.master_df.columns:
-                st.session_state.master_df[col] = ""
-        st.rerun()
+            st.dataframe(st.session_state.log_output_df, use_container_width=True)
+
+    with st.expander("📋 Master Output Preview", expanded=False):
+        if st.session_state.master_output_df.empty:
+            st.caption("No wells processed yet.")
+        else:
+            st.dataframe(st.session_state.master_output_df, use_container_width=True)
